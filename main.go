@@ -97,6 +97,17 @@ func showErrorBox(title, message string) {
 	)
 }
 
+func showInfoBox(title, message string) {
+	titlePtr, _ := syscall.UTF16PtrFromString(title)
+	msgPtr, _ := syscall.UTF16PtrFromString(message)
+	procMessageBoxW.Call(
+		0,
+		uintptr(unsafe.Pointer(msgPtr)),
+		uintptr(unsafe.Pointer(titlePtr)),
+		0x00000040, // MB_OK | MB_ICONINFORMATION
+	)
+}
+
 func main() {
 	fmt.Println("IDM Auto Closer Started...")
 
@@ -111,6 +122,8 @@ func main() {
 	}
 	// Ensure handle is closed when main exits (though process exit does this too)
 	defer procCloseHandle.Call(handle)
+
+	showInfoBox("IDM Auto Closer", "欢迎使用 IDM 自动关闭工具！\n\n本程序将在后台运行，监测 IDM 下载任务。\n当所有下载完成后，会自动关闭 IDM 进程。\n\nWelcome to IDM Auto Closer!\n\nThis program runs in the background monitoring IDM.\nIt will automatically close IDM when downloads finish.")
 
 	fmt.Println("Monitoring IDM activity...")
 
