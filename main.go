@@ -145,15 +145,18 @@ func main() {
 
 	// Configuration
 	const (
-		downloadThresholdSpeed = 10 * 1024 // 10 KB/s
-		idleThresholdSpeed     = 1 * 1024  // 1 KB/s
-		checkInterval          = 1 * time.Second
-		finishDelay            = 10000 * time.Millisecond
+		downloadThresholdSpeed = 5 * 1024         // 5 KB/s - Threshold to detect download start
+		idleThresholdSpeed     = 1 * 1024         // 1 KB/s - Threshold to detect idle state
+		checkInterval          = 1 * time.Second  // Check interval
+		finishDelay            = 30 * time.Second // Delay to confirm download finished (increased to 30s)
+		consecutiveIdleCount   = 5                // Number of consecutive idle checks to confirm finish
 	)
 
 	var lastReadCount uint64
+	var lastWriteCount uint64 // Monitor write activity as well
 	var lastCheckTime time.Time
 	var lowActivityStartTime time.Time
+	var idleCheckCount int // Consecutive idle counter
 	var pid uint32
 	var hProcess syscall.Handle
 
@@ -189,8 +192,10 @@ func main() {
 			io, err := getProcessIoCounters(hProcess)
 			if err == nil {
 				lastReadCount = io.ReadTransferCount
+				lastWriteCount = io.WriteTransferCount
 				lastCheckTime = time.Now()
 			}
+			idleCheckCount = 0
 			state = 1
 			continue
 		}
@@ -218,49 +223,61 @@ func main() {
 			duration = 1
 		}
 
-		// Calculate speed (Bytes per second)
+		// Calculate speed (Bytes per second) - consider both read and write activity
 		bytesRead := io.ReadTransferCount - lastReadCount
-		speed := float64(bytesRead) / duration
+		bytesWritten := io.WriteTransferCount - lastWriteCount
+		totalBytes := bytesRead + bytesWritten
+		readSpeed := float64(bytesRead) / duration
+		totalSpeed := float64(totalBytes) / duration
 
 		lastReadCount = io.ReadTransferCount
+		lastWriteCount = io.WriteTransferCount
 		lastCheckTime = now
 
 		// State Logic
 		switch state {
 		case 1: // Waiting for download start
-			if speed > downloadThresholdSpeed {
-				fmt.Printf("Download activity detected (Speed: %.2f KB/s). Monitoring...\n", speed/1024)
+			if readSpeed > downloadThresholdSpeed {
+				fmt.Printf("Download activity detected (Speed: %.2f KB/s). Monitoring...\n", readSpeed/1024)
 				state = 2
 				lowActivityStartTime = time.Time{}
+				idleCheckCount = 0
 			}
 		case 2: // Monitoring download
-			if speed < idleThresholdSpeed {
+			// Use total IO activity (read + write) to determine idle state
+			// This helps accurately detect if download has really stopped
+			if totalSpeed < idleThresholdSpeed {
+				idleCheckCount++
 				if lowActivityStartTime.IsZero() {
 					lowActivityStartTime = now
-				} else {
-					// Check how long we have been idle
-					idleDuration := now.Sub(lowActivityStartTime)
-					if idleDuration >= finishDelay {
-						fmt.Println("Download finished detected. Closing IDM...")
+					fmt.Printf("Low activity detected (Speed: %.2f KB/s). Waiting for confirmation...\n", totalSpeed/1024)
+				}
+				// Both conditions must be met: consecutive idle checks AND idle duration
+				idleDuration := now.Sub(lowActivityStartTime)
+				if idleCheckCount >= consecutiveIdleCount && idleDuration >= finishDelay {
+					fmt.Printf("Download finished confirmed (idle for %.1f seconds, %d consecutive checks). Closing IDM...\n",
+						idleDuration.Seconds(), idleCheckCount)
 
-						// Kill Process
-						err := terminateProcess(hProcess, 0)
-						if err != nil {
-							log.Printf("Failed to terminate IDM: %v\n", err)
-						} else {
-							fmt.Println("IDM Terminated.")
-						}
-
-						// Reset
-						syscall.CloseHandle(hProcess)
-						hProcess = 0
-						state = 0
+					// Kill Process
+					err := terminateProcess(hProcess, 0)
+					if err != nil {
+						log.Printf("Failed to terminate IDM: %v\n", err)
+					} else {
+						fmt.Println("IDM Terminated.")
 					}
+
+					// Reset
+					syscall.CloseHandle(hProcess)
+					hProcess = 0
+					state = 0
+					idleCheckCount = 0
 				}
 			} else {
-				// Still downloading
-				if !lowActivityStartTime.IsZero() {
-					lowActivityStartTime = time.Time{} // Reset
+				// Still downloading - activity detected, reset idle counter
+				if idleCheckCount > 0 || !lowActivityStartTime.IsZero() {
+					fmt.Printf("Download activity resumed (Speed: %.2f KB/s). Resetting idle counter.\n", totalSpeed/1024)
+					lowActivityStartTime = time.Time{}
+					idleCheckCount = 0
 				}
 			}
 		}
