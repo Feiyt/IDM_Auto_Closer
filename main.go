@@ -139,17 +139,15 @@ func main() {
 
 	// State machine
 	// 0: Waiting for IDM to start
-	// 1: Waiting for download activity (High traffic)
-	// 2: Monitoring download (Waiting for finish)
+	// 1: Monitoring IDM activity (will close if idle)
 	state := 0
 
 	// Configuration
 	const (
-		downloadThresholdSpeed = 5 * 1024         // 5 KB/s - Threshold to detect download start
-		idleThresholdSpeed     = 1 * 1024         // 1 KB/s - Threshold to detect idle state
-		checkInterval          = 1 * time.Second  // Check interval
-		finishDelay            = 30 * time.Second // Delay to confirm download finished (increased to 30s)
-		consecutiveIdleCount   = 5                // Number of consecutive idle checks to confirm finish
+		idleThresholdSpeed   = 1 * 1024         // 1 KB/s - Threshold to detect idle state
+		checkInterval        = 1 * time.Second  // Check interval
+		finishDelay          = 10 * time.Second // Delay to confirm idle state (reduced to 10s)
+		consecutiveIdleCount = 5                // Number of consecutive idle checks to confirm finish
 	)
 
 	var lastReadCount uint64
@@ -180,7 +178,7 @@ func main() {
 
 		// Process found
 		if state == 0 {
-			fmt.Printf("IDM detected (PID: %d). Waiting for download activity...\n", currentPid)
+			fmt.Printf("IDM detected (PID: %d). Monitoring for idle state...\n", currentPid)
 			pid = currentPid
 			hProcess, err = openProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ|PROCESS_TERMINATE, false, pid)
 			if err != nil {
@@ -196,6 +194,7 @@ func main() {
 				lastCheckTime = time.Now()
 			}
 			idleCheckCount = 0
+			lowActivityStartTime = time.Time{} // Initialize idle timer
 			state = 1
 			continue
 		}
@@ -236,26 +235,27 @@ func main() {
 
 		// State Logic
 		switch state {
-		case 1: // Waiting for download start
-			if readSpeed > downloadThresholdSpeed {
-				fmt.Printf("Download activity detected (Speed: %.2f KB/s). Monitoring...\n", readSpeed/1024)
-				state = 2
-				lowActivityStartTime = time.Time{}
-				idleCheckCount = 0
-			}
-		case 2: // Monitoring download
-			// Use total IO activity (read + write) to determine idle state
-			// This helps accurately detect if download has really stopped
+		case 1: // Monitoring IDM - close if idle
+			// Print current activity for debugging
+			fmt.Printf("[Monitoring] Read: %.2f KB/s | Write: %.2f KB/s | Total: %.2f KB/s | Idle count: %d\n",
+				readSpeed/1024, float64(bytesWritten)/duration/1024, totalSpeed/1024, idleCheckCount)
+
+			// Check if IDM is idle (low activity)
 			if totalSpeed < idleThresholdSpeed {
 				idleCheckCount++
 				if lowActivityStartTime.IsZero() {
 					lowActivityStartTime = now
-					fmt.Printf("Low activity detected (Speed: %.2f KB/s). Waiting for confirmation...\n", totalSpeed/1024)
+					fmt.Printf("Idle state detected (Speed: %.2f KB/s). Waiting for confirmation...\n", totalSpeed/1024)
+				} else {
+					idleDuration := now.Sub(lowActivityStartTime)
+					fmt.Printf("Still idle (%.1f/%.0f seconds, %d/%d checks)\n",
+						idleDuration.Seconds(), finishDelay.Seconds(), idleCheckCount, consecutiveIdleCount)
 				}
+
 				// Both conditions must be met: consecutive idle checks AND idle duration
 				idleDuration := now.Sub(lowActivityStartTime)
 				if idleCheckCount >= consecutiveIdleCount && idleDuration >= finishDelay {
-					fmt.Printf("Download finished confirmed (idle for %.1f seconds, %d consecutive checks). Closing IDM...\n",
+					fmt.Printf("IDM idle confirmed (idle for %.1f seconds, %d consecutive checks). Closing IDM...\n",
 						idleDuration.Seconds(), idleCheckCount)
 
 					// Kill Process
@@ -273,9 +273,9 @@ func main() {
 					idleCheckCount = 0
 				}
 			} else {
-				// Still downloading - activity detected, reset idle counter
+				// Activity detected, reset idle counter
 				if idleCheckCount > 0 || !lowActivityStartTime.IsZero() {
-					fmt.Printf("Download activity resumed (Speed: %.2f KB/s). Resetting idle counter.\n", totalSpeed/1024)
+					fmt.Printf("Activity detected (Speed: %.2f KB/s). Resetting idle counter.\n", totalSpeed/1024)
 					lowActivityStartTime = time.Time{}
 					idleCheckCount = 0
 				}
@@ -288,9 +288,14 @@ func main() {
 
 func getIDMPath() (string, error) {
 	var hKey uintptr
+	keyPath, err := syscall.UTF16PtrFromString(`Software\DownloadManager`)
+	if err != nil {
+		return "", fmt.Errorf("failed to convert key path: %v", err)
+	}
+
 	ret, _, _ := procRegOpenKeyExW.Call(
 		uintptr(HKEY_CURRENT_USER),
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr(`Software\DownloadManager`))),
+		uintptr(unsafe.Pointer(keyPath)),
 		0,
 		uintptr(KEY_READ),
 		uintptr(unsafe.Pointer(&hKey)),
@@ -300,11 +305,16 @@ func getIDMPath() (string, error) {
 	}
 	defer procRegCloseKey.Call(hKey)
 
+	valueName, err := syscall.UTF16PtrFromString("ExePath")
+	if err != nil {
+		return "", fmt.Errorf("failed to convert value name: %v", err)
+	}
+
 	var bufLen uint32 = 1024
 	buf := make([]uint16, bufLen)
 	ret, _, _ = procRegQueryValueExW.Call(
 		hKey,
-		uintptr(unsafe.Pointer(syscall.StringToUTF16Ptr("ExePath"))),
+		uintptr(unsafe.Pointer(valueName)),
 		0,
 		0,
 		uintptr(unsafe.Pointer(&buf[0])),
@@ -314,31 +324,34 @@ func getIDMPath() (string, error) {
 		return "", fmt.Errorf("RegQueryValueExW failed with error code %d", ret)
 	}
 
-	return syscall.UTF16ToString(buf), nil
+	path := syscall.UTF16ToString(buf)
+	fmt.Printf("Registry read successful. IDM Path: %s\n", path)
+	return path, nil
 }
 
 func findProcessID(exeName string) (uint32, error) {
-	snapshot, _, err := procCreateToolhelp32Snapshot.Call(uintptr(TH32CS_SNAPPROCESS), 0)
-	if snapshot == uintptr(syscall.InvalidHandle) {
-		return 0, err
+	snapshot, _, _ := procCreateToolhelp32Snapshot.Call(uintptr(TH32CS_SNAPPROCESS), 0)
+	if snapshot == 0 || snapshot == uintptr(syscall.InvalidHandle) {
+		return 0, fmt.Errorf("CreateToolhelp32Snapshot failed")
 	}
 	defer syscall.CloseHandle(syscall.Handle(snapshot))
 
 	var pe32 PROCESSENTRY32W
 	pe32.Size = uint32(unsafe.Sizeof(pe32))
 
-	r1, _, err := procProcess32FirstW.Call(snapshot, uintptr(unsafe.Pointer(&pe32)))
+	r1, _, _ := procProcess32FirstW.Call(snapshot, uintptr(unsafe.Pointer(&pe32)))
 	if r1 == 0 {
-		return 0, err
+		return 0, fmt.Errorf("Process32FirstW failed")
 	}
 
 	for {
 		name := syscall.UTF16ToString(pe32.ExeFile[:])
 		if name == exeName {
+			fmt.Printf("Found process: %s (PID: %d)\n", name, pe32.ProcessID)
 			return pe32.ProcessID, nil
 		}
 
-		r1, _, err = procProcess32NextW.Call(snapshot, uintptr(unsafe.Pointer(&pe32)))
+		r1, _, _ = procProcess32NextW.Call(snapshot, uintptr(unsafe.Pointer(&pe32)))
 		if r1 == 0 {
 			break
 		}
@@ -352,26 +365,28 @@ func openProcess(desiredAccess uint32, inheritHandle bool, processId uint32) (sy
 	if inheritHandle {
 		inherit = 1
 	}
-	r1, _, err := procOpenProcess.Call(uintptr(desiredAccess), uintptr(inherit), uintptr(processId))
+	r1, _, _ := procOpenProcess.Call(uintptr(desiredAccess), uintptr(inherit), uintptr(processId))
 	if r1 == 0 {
-		return 0, err
+		return 0, fmt.Errorf("OpenProcess failed for PID %d", processId)
 	}
+	fmt.Printf("Successfully opened process handle for PID %d\n", processId)
 	return syscall.Handle(r1), nil
 }
 
 func getProcessIoCounters(hProcess syscall.Handle) (IO_COUNTERS, error) {
 	var io IO_COUNTERS
-	r1, _, err := procGetProcessIoCounters.Call(uintptr(hProcess), uintptr(unsafe.Pointer(&io)))
+	r1, _, _ := procGetProcessIoCounters.Call(uintptr(hProcess), uintptr(unsafe.Pointer(&io)))
 	if r1 == 0 {
-		return io, err
+		return io, fmt.Errorf("GetProcessIoCounters failed")
 	}
 	return io, nil
 }
 
 func terminateProcess(hProcess syscall.Handle, exitCode uint32) error {
-	r1, _, err := procTerminateProcess.Call(uintptr(hProcess), uintptr(exitCode))
+	r1, _, _ := procTerminateProcess.Call(uintptr(hProcess), uintptr(exitCode))
 	if r1 == 0 {
-		return err
+		return fmt.Errorf("TerminateProcess failed")
 	}
+	fmt.Println("Process terminated successfully")
 	return nil
 }
