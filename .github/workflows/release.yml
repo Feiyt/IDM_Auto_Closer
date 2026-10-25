@@ -1,0 +1,72 @@
+name: Build & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write 
+
+jobs:
+  build-windows:
+    runs-on: windows-latest 
+    timeout-minutes: 10
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.21' 
+          cache: true
+          cache-dependency-path: go.mod
+
+      - name: Read and validate release version
+        id: version
+        shell: pwsh
+        run: |
+          $content = Get-Content -Raw .\main.go
+          $pattern = '(?m)^[\t ]*const[\t ]+appVersion[\t\r\n ]*=[\t\r\n ]*"([^"]+)"'
+          if ($content -notmatch $pattern) {
+            throw "Could not read appVersion from main.go."
+          }
+
+          $version = $Matches[1]
+          $expectedTag = "v$version"
+          if ("${{ github.ref_name }}" -ne $expectedTag) {
+            throw "Release tag '${{ github.ref_name }}' does not match appVersion '$version'. Expected '$expectedTag'."
+          }
+
+          $output = "IDM_Auto_Closer-Windows-$version.exe"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "output=$output" >> $env:GITHUB_OUTPUT
+
+      - name: Build the single release executable with build.bat
+        shell: cmd
+        run: call .\build.bat release
+
+      - name: Verify release executable
+        shell: pwsh
+        run: |
+          if (-not (Test-Path -LiteralPath "${{ steps.version.outputs.output }}")) {
+            throw "Expected release executable was not created."
+          }
+
+      - name: Upload release artifact backup
+        uses: actions/upload-artifact@v4
+        with:
+          name: IDM_Auto_Closer-Windows-${{ steps.version.outputs.version }}
+          path: ${{ steps.version.outputs.output }}
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Create Release & Upload exe
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: ${{ steps.version.outputs.output }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

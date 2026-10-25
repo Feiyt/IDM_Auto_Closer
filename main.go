@@ -9,6 +9,10 @@ import (
 	"unsafe"
 )
 
+const appVersion = "1.0.6"
+
+var buildVersion = appVersion
+
 // Windows API Constants
 const (
 	KEY_READ                  = 0x20019
@@ -111,7 +115,7 @@ func showInfoBox(title, message string) {
 }
 
 func main() {
-	fmt.Println("IDM Auto Closer Started...")
+	fmt.Printf("IDM Auto Closer v%s Started...\n", buildVersion)
 
 	// Use a unique name without Global\ prefix to avoid permission issues,
 	// but specific enough to be unique system-wide if possible (in Local namespace).
@@ -132,7 +136,7 @@ func main() {
 	// Ensure handle is closed when main exits (though process exit does this too)
 	defer procCloseHandle.Call(handle)
 
-	showInfoBox("IDM Auto Closer", "欢迎使用 IDM 自动关闭工具！\n\n本程序将在后台运行，监测 IDM 下载任务。\n当所有下载完成后，会自动关闭 IDM 进程。\n\nWelcome to IDM Auto Closer!\n\nThis program runs in the background monitoring IDM.\nIt will automatically close IDM when downloads finish.")
+	showInfoBox("IDM Auto Closer", fmt.Sprintf("欢迎使用 IDM 自动关闭工具！\n版本：%s\n\n本程序将在后台运行，监测 IDM 下载任务。\n当所有下载完成后，会自动关闭 IDM 进程。\n\nWelcome to IDM Auto Closer!\nVersion: %s\n\nThis program runs in the background monitoring IDM.\nIt will automatically close IDM when downloads finish.", buildVersion, buildVersion))
 
 	fmt.Println("Monitoring IDM activity...")
 
