@@ -1,6 +1,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"log"
 	"syscall"
@@ -14,10 +15,11 @@ const (
 	HKEY_CURRENT_USER         = 0x80000001
 	TH32CS_SNAPPROCESS        = 0x00000002
 	PROCESS_QUERY_INFORMATION = 0x0400
-	PROCESS_VM_READ           = 0x0010
 	PROCESS_TERMINATE         = 0x0001
 	ERROR_ALREADY_EXISTS      = 183
 )
+
+var errAlreadyRunning = errors.New("another instance is already running")
 
 var (
 	modadvapi32 = syscall.NewLazyDLL("advapi32.dll")
@@ -79,7 +81,7 @@ func createMutex(name string) (uintptr, error) {
 	if err != nil {
 		if errno, ok := err.(syscall.Errno); ok {
 			if errno == ERROR_ALREADY_EXISTS {
-				return ret, fmt.Errorf("another instance is already running")
+				return ret, errAlreadyRunning
 			}
 		}
 	}
@@ -117,7 +119,14 @@ func main() {
 	const mutexName = "IDM_Auto_Closer_Unique_Mutex_v1"
 	handle, err := createMutex(mutexName)
 	if err != nil {
-		showErrorBox("IDM Auto Closer", "程序已在运行中！\nProgram is already running.")
+		if handle != 0 {
+			procCloseHandle.Call(handle)
+		}
+		if errors.Is(err, errAlreadyRunning) {
+			showErrorBox("IDM Auto Closer", "程序已在运行中！\nProgram is already running.")
+		} else {
+			showErrorBox("IDM Auto Closer", fmt.Sprintf("无法创建单实例锁：%v", err))
+		}
 		return
 	}
 	// Ensure handle is closed when main exits (though process exit does this too)
@@ -155,6 +164,7 @@ func main() {
 	var lastCheckTime time.Time
 	var lowActivityStartTime time.Time
 	var idleCheckCount int // Consecutive idle counter
+	var hasObservedActivity bool
 	var pid uint32
 	var hProcess syscall.Handle
 
@@ -172,6 +182,7 @@ func main() {
 					hProcess = 0
 				}
 				state = 0
+				hasObservedActivity = false
 			}
 			continue
 		}
@@ -180,7 +191,7 @@ func main() {
 		if state == 0 {
 			fmt.Printf("IDM detected (PID: %d). Monitoring for idle state...\n", currentPid)
 			pid = currentPid
-			hProcess, err = openProcess(PROCESS_QUERY_INFORMATION|PROCESS_VM_READ|PROCESS_TERMINATE, false, pid)
+			hProcess, err = openProcess(PROCESS_QUERY_INFORMATION|PROCESS_TERMINATE, false, pid)
 			if err != nil {
 				log.Printf("Error opening process: %v\n", err)
 				continue
@@ -188,13 +199,18 @@ func main() {
 
 			// Initialize counters
 			io, err := getProcessIoCounters(hProcess)
-			if err == nil {
-				lastReadCount = io.ReadTransferCount
-				lastWriteCount = io.WriteTransferCount
-				lastCheckTime = time.Now()
+			if err != nil {
+				log.Printf("Error initializing IO counters: %v. Retrying.\n", err)
+				syscall.CloseHandle(hProcess)
+				hProcess = 0
+				continue
 			}
+			lastReadCount = io.ReadTransferCount
+			lastWriteCount = io.WriteTransferCount
+			lastCheckTime = time.Now()
 			idleCheckCount = 0
 			lowActivityStartTime = time.Time{} // Initialize idle timer
+			hasObservedActivity = false
 			state = 1
 			continue
 		}
@@ -203,7 +219,9 @@ func main() {
 		if currentPid != pid {
 			fmt.Println("IDM PID changed. Resetting.")
 			syscall.CloseHandle(hProcess)
+			hProcess = 0
 			state = 0
+			hasObservedActivity = false
 			continue
 		}
 
@@ -212,7 +230,9 @@ func main() {
 		if err != nil {
 			log.Printf("Error getting IO counters: %v. Resetting.\n", err)
 			syscall.CloseHandle(hProcess)
+			hProcess = 0
 			state = 0
+			hasObservedActivity = false
 			continue
 		}
 
@@ -223,8 +243,13 @@ func main() {
 		}
 
 		// Calculate speed (Bytes per second) - consider both read and write activity
-		bytesRead := io.ReadTransferCount - lastReadCount
-		bytesWritten := io.WriteTransferCount - lastWriteCount
+		var bytesRead, bytesWritten uint64
+		if io.ReadTransferCount >= lastReadCount {
+			bytesRead = io.ReadTransferCount - lastReadCount
+		}
+		if io.WriteTransferCount >= lastWriteCount {
+			bytesWritten = io.WriteTransferCount - lastWriteCount
+		}
 		totalBytes := bytesRead + bytesWritten
 		readSpeed := float64(bytesRead) / duration
 		totalSpeed := float64(totalBytes) / duration
@@ -240,6 +265,11 @@ func main() {
 			fmt.Printf("[Monitoring] Read: %.2f KB/s | Write: %.2f KB/s | Total: %.2f KB/s | Idle count: %d\n",
 				readSpeed/1024, float64(bytesWritten)/duration/1024, totalSpeed/1024, idleCheckCount)
 
+			// Require observed activity before allowing automatic shutdown.
+			if totalSpeed >= idleThresholdSpeed {
+				hasObservedActivity = true
+			}
+
 			// Check if IDM is idle (low activity)
 			if totalSpeed < idleThresholdSpeed {
 				idleCheckCount++
@@ -254,7 +284,7 @@ func main() {
 
 				// Both conditions must be met: consecutive idle checks AND idle duration
 				idleDuration := now.Sub(lowActivityStartTime)
-				if idleCheckCount >= consecutiveIdleCount && idleDuration >= finishDelay {
+				if hasObservedActivity && idleCheckCount >= consecutiveIdleCount && idleDuration >= finishDelay {
 					fmt.Printf("IDM idle confirmed (idle for %.1f seconds, %d consecutive checks). Closing IDM...\n",
 						idleDuration.Seconds(), idleCheckCount)
 
@@ -270,6 +300,7 @@ func main() {
 					syscall.CloseHandle(hProcess)
 					hProcess = 0
 					state = 0
+					hasObservedActivity = false
 					idleCheckCount = 0
 				}
 			} else {

@@ -11,17 +11,10 @@ if %errorlevel% neq 0 (
     exit /b 1
 )
 
-REM Initialize Go module if not exists
-if not exist go.mod (
-    echo Initializing Go module...
-    go mod init IDM_Auto_Closer
-    go mod tidy
-)
-
 REM Build with GUI flag to hide console window
 REM To see the console output for debugging, use: go build -o IDM_Auto_Closer.exe main.go
 echo Building...
-go build -ldflags "-H=windowsgui" -o IDM_Auto_Closer.exe main.go
+go build -ldflags "-H=windowsgui" -o IDM_Auto_Closer.exe .
 
 if %errorlevel% equ 0 (
     echo Compilation successful!
