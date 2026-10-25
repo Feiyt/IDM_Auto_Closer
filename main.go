@@ -4,19 +4,24 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"path/filepath"
 	"syscall"
 	"time"
 	"unsafe"
 )
 
-const appVersion = "1.0.6"
+const appVersion = "1.0.7"
 
 var buildVersion = appVersion
 
 // Windows API Constants
 const (
 	KEY_READ                  = 0x20019
+	KEY_SET_VALUE             = 0x0002
 	HKEY_CURRENT_USER         = 0x80000001
+	REG_SZ                    = 1
+	ERROR_NO_MORE_ITEMS       = 259
 	TH32CS_SNAPPROCESS        = 0x00000002
 	PROCESS_QUERY_INFORMATION = 0x0400
 	PROCESS_TERMINATE         = 0x0001
@@ -32,6 +37,9 @@ var (
 
 	procRegOpenKeyExW    = modadvapi32.NewProc("RegOpenKeyExW")
 	procRegQueryValueExW = modadvapi32.NewProc("RegQueryValueExW")
+	procRegSetValueExW   = modadvapi32.NewProc("RegSetValueExW")
+	procRegDeleteValueW  = modadvapi32.NewProc("RegDeleteValueW")
+	procRegEnumValueW    = modadvapi32.NewProc("RegEnumValueW")
 	procRegCloseKey      = modadvapi32.NewProc("RegCloseKey")
 
 	procCreateToolhelp32Snapshot = modkernel32.NewProc("CreateToolhelp32Snapshot")
@@ -136,6 +144,10 @@ func main() {
 	// Ensure handle is closed when main exits (though process exit does this too)
 	defer procCloseHandle.Call(handle)
 
+	if err := registerStartup(); err != nil {
+		log.Printf("Warning: Could not configure automatic startup: %v\n", err)
+	}
+
 	showInfoBox("IDM Auto Closer", fmt.Sprintf("欢迎使用 IDM 自动关闭工具！\n版本：%s\n\n本程序将在后台运行，监测 IDM 下载任务。\n当所有下载完成后，会自动关闭 IDM 进程。\n\nWelcome to IDM Auto Closer!\nVersion: %s\n\nThis program runs in the background monitoring IDM.\nIt will automatically close IDM when downloads finish.", buildVersion, buildVersion))
 
 	fmt.Println("Monitoring IDM activity...")
@@ -157,18 +169,18 @@ func main() {
 
 	// Configuration
 	const (
-		idleThresholdSpeed   = 1 * 1024         // 1 KB/s - Threshold to detect idle state
-		checkInterval        = 1 * time.Second  // Check interval
-		finishDelay          = 10 * time.Second // Delay to confirm idle state (reduced to 10s)
-		consecutiveIdleCount = 5                // Number of consecutive idle checks to confirm finish
+		idleThresholdSpeed = 1 * 1024        // 1 KB/s - Threshold to detect idle state
+		checkInterval      = 1 * time.Second // Check interval
 	)
+	finishDelay := 10 * time.Second
+	consecutiveIdleCount := 1
+	fmt.Printf("Idle confirmation delay: %s\n", finishDelay)
 
 	var lastReadCount uint64
 	var lastWriteCount uint64 // Monitor write activity as well
 	var lastCheckTime time.Time
 	var lowActivityStartTime time.Time
 	var idleCheckCount int // Consecutive idle counter
-	var hasObservedActivity bool
 	var pid uint32
 	var hProcess syscall.Handle
 
@@ -186,7 +198,6 @@ func main() {
 					hProcess = 0
 				}
 				state = 0
-				hasObservedActivity = false
 			}
 			continue
 		}
@@ -214,7 +225,6 @@ func main() {
 			lastCheckTime = time.Now()
 			idleCheckCount = 0
 			lowActivityStartTime = time.Time{} // Initialize idle timer
-			hasObservedActivity = false
 			state = 1
 			continue
 		}
@@ -225,7 +235,6 @@ func main() {
 			syscall.CloseHandle(hProcess)
 			hProcess = 0
 			state = 0
-			hasObservedActivity = false
 			continue
 		}
 
@@ -236,7 +245,6 @@ func main() {
 			syscall.CloseHandle(hProcess)
 			hProcess = 0
 			state = 0
-			hasObservedActivity = false
 			continue
 		}
 
@@ -269,11 +277,6 @@ func main() {
 			fmt.Printf("[Monitoring] Read: %.2f KB/s | Write: %.2f KB/s | Total: %.2f KB/s | Idle count: %d\n",
 				readSpeed/1024, float64(bytesWritten)/duration/1024, totalSpeed/1024, idleCheckCount)
 
-			// Require observed activity before allowing automatic shutdown.
-			if totalSpeed >= idleThresholdSpeed {
-				hasObservedActivity = true
-			}
-
 			// Check if IDM is idle (low activity)
 			if totalSpeed < idleThresholdSpeed {
 				idleCheckCount++
@@ -288,7 +291,7 @@ func main() {
 
 				// Both conditions must be met: consecutive idle checks AND idle duration
 				idleDuration := now.Sub(lowActivityStartTime)
-				if hasObservedActivity && idleCheckCount >= consecutiveIdleCount && idleDuration >= finishDelay {
+				if idleCheckCount >= consecutiveIdleCount && idleDuration >= finishDelay {
 					fmt.Printf("IDM idle confirmed (idle for %.1f seconds, %d consecutive checks). Closing IDM...\n",
 						idleDuration.Seconds(), idleCheckCount)
 
@@ -304,7 +307,6 @@ func main() {
 					syscall.CloseHandle(hProcess)
 					hProcess = 0
 					state = 0
-					hasObservedActivity = false
 					idleCheckCount = 0
 				}
 			} else {
@@ -320,6 +322,103 @@ func main() {
 }
 
 // Helper Functions
+
+func registerStartup() error {
+	executablePath, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("get executable path: %w", err)
+	}
+	executablePath, err = filepath.Abs(executablePath)
+	if err != nil {
+		return fmt.Errorf("resolve executable path: %w", err)
+	}
+
+	keyPath, err := syscall.UTF16PtrFromString(`Software\Microsoft\Windows\CurrentVersion\Run`)
+	if err != nil {
+		return fmt.Errorf("convert startup key path: %w", err)
+	}
+	var keyHandle uintptr
+	ret, _, _ := procRegOpenKeyExW.Call(
+		uintptr(HKEY_CURRENT_USER),
+		uintptr(unsafe.Pointer(keyPath)),
+		0,
+		uintptr(KEY_READ|KEY_SET_VALUE),
+		uintptr(unsafe.Pointer(&keyHandle)),
+	)
+	if ret != 0 {
+		return fmt.Errorf("RegOpenKeyExW failed with error code %d", ret)
+	}
+	defer procRegCloseKey.Call(keyHandle)
+
+	if err := removeLegacyStartupValues(keyHandle); err != nil {
+		return err
+	}
+
+	valueName, err := syscall.UTF16PtrFromString("IDM Auto Closer")
+	if err != nil {
+		return fmt.Errorf("convert startup value name: %w", err)
+	}
+	valueData, err := syscall.UTF16FromString(fmt.Sprintf(`"%s"`, executablePath))
+	if err != nil {
+		return fmt.Errorf("convert executable path: %w", err)
+	}
+	dataSize := uint32(len(valueData) * 2)
+	ret, _, _ = procRegSetValueExW.Call(
+		keyHandle,
+		uintptr(unsafe.Pointer(valueName)),
+		0,
+		uintptr(REG_SZ),
+		uintptr(unsafe.Pointer(&valueData[0])),
+		uintptr(dataSize),
+	)
+	if ret != 0 {
+		return fmt.Errorf("RegSetValueExW failed with error code %d", ret)
+	}
+	return nil
+}
+
+func removeLegacyStartupValues(keyHandle uintptr) error {
+	const currentValueName = "IDM Auto Closer"
+	for index := uint32(0); ; {
+		valueName := make([]uint16, 256)
+		valueNameLength := uint32(len(valueName))
+		valueType := uint32(0)
+		valueData := make([]byte, 4096)
+		valueDataLength := uint32(len(valueData))
+		ret, _, _ := procRegEnumValueW.Call(
+			keyHandle,
+			uintptr(index),
+			uintptr(unsafe.Pointer(&valueName[0])),
+			uintptr(unsafe.Pointer(&valueNameLength)),
+			0,
+			uintptr(unsafe.Pointer(&valueType)),
+			uintptr(unsafe.Pointer(&valueData[0])),
+			uintptr(unsafe.Pointer(&valueDataLength)),
+		)
+		if ret == ERROR_NO_MORE_ITEMS {
+			return nil
+		}
+		if ret != 0 {
+			return fmt.Errorf("RegEnumValueW failed with error code %d", ret)
+		}
+
+		name := syscall.UTF16ToString(valueName[:valueNameLength])
+		if name != currentValueName && (name == "IDM_Auto_Closer" ||
+			len(name) >= len("IDM_Auto_Closer") && name[:len("IDM_Auto_Closer")] == "IDM_Auto_Closer" ||
+			len(name) >= len("IDM Auto Closer ") && name[:len("IDM Auto Closer ")] == "IDM Auto Closer ") {
+			legacyName, err := syscall.UTF16PtrFromString(name)
+			if err != nil {
+				return fmt.Errorf("convert legacy startup value name: %w", err)
+			}
+			ret, _, _ := procRegDeleteValueW.Call(keyHandle, uintptr(unsafe.Pointer(legacyName)))
+			if ret != 0 {
+				return fmt.Errorf("RegDeleteValueW failed with error code %d", ret)
+			}
+			continue
+		}
+		index++
+	}
+}
 
 func getIDMPath() (string, error) {
 	var hKey uintptr

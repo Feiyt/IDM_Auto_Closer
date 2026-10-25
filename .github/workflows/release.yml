@@ -39,34 +39,57 @@ jobs:
             throw "Release tag '${{ github.ref_name }}' does not match appVersion '$version'. Expected '$expectedTag'."
           }
 
-          $output = "IDM_Auto_Closer-Windows-$version.exe"
+          $outputDirectory = "IDM_Auto_Closer"
+          $mainOutput = "$outputDirectory/IDM_Auto_Closer-Windows-$version.exe"
+          $cleanupOutput = "$outputDirectory/Data Cleanup.exe"
+          $packageOutput = "IDM_Auto_Closer-Windows-$version.zip"
           "version=$version" >> $env:GITHUB_OUTPUT
-          "output=$output" >> $env:GITHUB_OUTPUT
+          "main_output=$mainOutput" >> $env:GITHUB_OUTPUT
+          "cleanup_output=$cleanupOutput" >> $env:GITHUB_OUTPUT
+          "package_output=$packageOutput" >> $env:GITHUB_OUTPUT
 
-      - name: Build the single release executable with build.bat
+      - name: Build release executables with build.bat
         shell: cmd
         run: call .\build.bat release
 
-      - name: Verify release executable
+      - name: Verify release executables
         shell: pwsh
         run: |
-          if (-not (Test-Path -LiteralPath "${{ steps.version.outputs.output }}")) {
-            throw "Expected release executable was not created."
+          $outputs = @(
+            "${{ steps.version.outputs.main_output }}",
+            "${{ steps.version.outputs.cleanup_output }}"
+          )
+          foreach ($output in $outputs) {
+            if (-not (Test-Path -LiteralPath $output)) {
+              throw "Expected release executable was not created: $output"
+            }
+          }
+
+      - name: Package release
+        shell: pwsh
+        run: |
+          $package = "${{ steps.version.outputs.package_output }}"
+          if (Test-Path -LiteralPath $package) {
+            Remove-Item -LiteralPath $package -Force
+          }
+          Compress-Archive -Path "IDM_Auto_Closer\*" -DestinationPath $package -CompressionLevel Optimal
+          if (-not (Test-Path -LiteralPath $package)) {
+            throw "Release package was not created: $package"
           }
 
       - name: Upload release artifact backup
         uses: actions/upload-artifact@v4
         with:
           name: IDM_Auto_Closer-Windows-${{ steps.version.outputs.version }}
-          path: ${{ steps.version.outputs.output }}
+          path: ${{ steps.version.outputs.package_output }}
           if-no-files-found: error
           retention-days: 7
 
-      - name: Create Release & Upload exe
+      - name: Create Release & Upload package
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
           fail_on_unmatched_files: true
-          files: ${{ steps.version.outputs.output }}
+          files: ${{ steps.version.outputs.package_output }}
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
